@@ -1,0 +1,1144 @@
+from __future__ import annotations
+
+import json
+import os
+import random
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from multilevel.canonical import attach_certificate_hash, sha256_obj, write_json
+from multilevel.components import LARGE_EXAMPLE_CONSTRAINTS
+from multilevel.modeling import save_model_artifacts, sample_model, train_model
+from multilevel.mutations import DIVERSE_ANNEALED_LOCAL_SEARCH, mutate_instance
+from multilevel.provenance import attach_runtime_provenance
+from multilevel.representations import (
+    decoded_geometry,
+    initial_instance_for_representation,
+    repair_instance_for_representation,
+)
+from multilevel.render import render_certificate
+from multilevel.scorers import guillotine, misr, unit_square
+from multilevel.surrogates import surrogate_score
+from multilevel.tokenizer import instance_to_text
+
+
+SCORERS = {
+    "misr": misr,
+    "unit_square": unit_square,
+    "guillotine": guillotine,
+}
+
+def _model_artifact_keep() -> int:
+    raw = os.environ.get("PATTERNBOOST_MODEL_ARTIFACT_KEEP", "1")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
+def _prune_model_artifacts(model_dir: Path, *, keep: int) -> None:
+    if keep < 0 or not model_dir.exists():
+        return
+    snapshots = sorted(
+        (path for path in model_dir.iterdir() if path.is_dir() and path.name.startswith("gen")),
+        key=lambda path: path.name,
+    )
+    for old in snapshots[:-keep] if keep else snapshots:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _resolution_diversity_active(
+    problem: str,
+    representation: str,
+    preserve_resolution_diversity: bool,
+) -> bool:
+    return (
+        preserve_resolution_diversity
+        and problem == "unit_square"
+        and representation == "sqstab_exact_grid"
+    )
+
+
+def _unit_square_resolution_values(grid: int) -> tuple[int, ...]:
+    return tuple(range(1, max(1, min(grid + 2, 4)) + 1))
+
+
+def _set_unit_square_resolution(instance: dict[str, Any], side: int) -> None:
+    instance["side"] = side
+    payload = instance.get("_representation_payload")
+    if isinstance(payload, dict):
+        payload["side"] = side
+
+
+def _fresh_population(
+    problem: str,
+    representation: str,
+    rng: random.Random,
+    *,
+    count: int,
+    n: int,
+    grid: int,
+    preserve_resolution_diversity: bool,
+    resolution_offset: int = 0,
+) -> list[dict[str, Any]]:
+    population: list[dict[str, Any]] = []
+    resolutions = _unit_square_resolution_values(grid)
+    diverse = _resolution_diversity_active(problem, representation, preserve_resolution_diversity)
+    for index in range(max(0, count)):
+        instance = initial_instance_for_representation(problem, representation, rng, n=n, grid=grid)
+        if diverse:
+            side = resolutions[(resolution_offset + index) % len(resolutions)]
+            _set_unit_square_resolution(instance, side)
+        population.append(instance)
+    rng.shuffle(population)
+    return population
+
+
+def _resolution_bucket(instance: dict[str, Any]) -> int:
+    try:
+        return max(1, int(instance.get("side", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _unit_square_structural_signature(
+    row: tuple[float, dict[str, Any], dict[str, Any], str, str],
+) -> tuple[int, int, float, int, int, int]:
+    features = row[2]
+    try:
+        tau_lp = round(float(features.get("tau_lp", 0.0)), 2)
+    except (TypeError, ValueError):
+        tau_lp = 0.0
+    return (
+        _resolution_bucket(row[1]),
+        int(features.get("tau_int") or 0),
+        tau_lp,
+        int(features.get("lp_support") or 0),
+        int(features.get("max_line_frequency") or 0),
+        int(features.get("line_count") or 0) // 4,
+    )
+
+
+def _select_structurally_diverse(
+    rows: list[tuple[float, dict[str, Any], dict[str, Any], str, str]],
+    limit: int,
+) -> list[tuple[float, dict[str, Any], dict[str, Any], str, str]]:
+    selected = []
+    signatures = set()
+    for row in rows:
+        signature = _unit_square_structural_signature(row)
+        if selected and signature in signatures:
+            continue
+        selected.append(row)
+        signatures.add(signature)
+        if len(selected) >= limit:
+            return selected
+    selected_ids = {row[3] for row in selected}
+    for row in rows:
+        if row[3] in selected_ids:
+            continue
+        selected.append(row)
+        selected_ids.add(row[3])
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _select_elites(
+    scored: list[tuple[float, dict[str, Any], dict[str, Any], str, str]],
+    *,
+    elite_size: int,
+    problem: str,
+    representation: str,
+    preserve_resolution_diversity: bool,
+    local_search: str | None = None,
+) -> list[tuple[float, dict[str, Any], dict[str, Any], str, str]]:
+    limit = max(1, elite_size)
+    structural_diversity = (
+        problem == "unit_square"
+        and representation == "sqstab_exact_grid"
+        and local_search == DIVERSE_ANNEALED_LOCAL_SEARCH
+    )
+    if not _resolution_diversity_active(problem, representation, preserve_resolution_diversity):
+        return _select_structurally_diverse(scored, limit) if structural_diversity else scored[:limit]
+
+    buckets: dict[int, list[tuple[float, dict[str, Any], dict[str, Any], str, str]]] = {}
+    for row in scored:
+        buckets.setdefault(_resolution_bucket(row[1]), []).append(row)
+
+    selected: list[tuple[float, dict[str, Any], dict[str, Any], str, str]] = []
+    sides = sorted(buckets)
+    base, remainder = divmod(limit, max(1, len(sides)))
+    for position, side in enumerate(sides):
+        quota = base + (1 if position < remainder else 0)
+        if quota <= 0:
+            continue
+        rows = buckets[side]
+        newest_immigrant = max(
+            (row for row in rows if row[4] == "random_immigrant"),
+            key=lambda row: int(row[1].get("_immigrant_generation", -1)),
+            default=None,
+        )
+        objective_quota = quota - (1 if newest_immigrant is not None and quota >= 2 else 0)
+        objective_rows = [row for row in rows if row is not newest_immigrant]
+        if structural_diversity:
+            selected.extend(_select_structurally_diverse(objective_rows, objective_quota))
+        else:
+            selected.extend(objective_rows[:objective_quota])
+        if newest_immigrant is not None and quota >= 2:
+            selected.append(newest_immigrant)
+
+    selected_ids = {row[3] for row in selected}
+    for row in scored:
+        if len(selected) >= limit:
+            break
+        if row[3] not in selected_ids:
+            selected.append(row)
+            selected_ids.add(row[3])
+    return selected
+
+
+def _select_archive_rows(
+    archive: list[tuple[float, dict[str, Any]]],
+    *,
+    limit: int,
+    problem: str,
+    representation: str,
+    preserve_resolution_diversity: bool,
+) -> list[tuple[float, dict[str, Any]]]:
+    ranked = sorted(archive, key=lambda item: item[0], reverse=True)
+    if not _resolution_diversity_active(problem, representation, preserve_resolution_diversity):
+        return ranked[:limit]
+
+    buckets: dict[int, list[tuple[float, dict[str, Any]]]] = {}
+    for row in ranked:
+        buckets.setdefault(_resolution_bucket(row[1]), []).append(row)
+    selected: list[tuple[float, dict[str, Any]]] = []
+    depth = 0
+    while len(selected) < limit:
+        added = False
+        for side in sorted(buckets):
+            rows = buckets[side]
+            if depth < len(rows):
+                selected.append(rows[depth])
+                added = True
+                if len(selected) >= limit:
+                    break
+        if not added:
+            break
+        depth += 1
+    return selected
+
+
+def _certificate_failure_allows_evolution(problem: str, reason: str | None) -> bool:
+    return problem == "unit_square" and bool(reason and reason.startswith("stabbing_integer_cover_below_"))
+
+
+def _as_tuple(value):
+    if isinstance(value, list):
+        return tuple(_as_tuple(item) for item in value)
+    return value
+
+
+def run_patternboost(
+    *,
+    problem: str,
+    representation: str,
+    local_search: str,
+    surrogate: str,
+    seed: int,
+    iterations: int,
+    population_size: int,
+    elite_size: int,
+    exact_every: int,
+    train_every: int,
+    model_samples: int,
+    model_kind: str,
+    model_epochs: int,
+    block_size: int,
+    model_embed_dim: int = 96,
+    model_num_heads: int = 4,
+    model_num_layers: int = 2,
+    model_batch_size: int = 32,
+    model_learning_rate: float = 3e-4,
+    training_archive_limit: int | None = None,
+    checkpoint_every: int,
+    resume: bool,
+    control_mode: str,
+    out_dir: str | Path,
+    n: int,
+    grid: int,
+    run_id: str | None = None,
+    stage: str = "pilot",
+    budget_seconds: int | None = None,
+    initial_pool_size: int | None = None,
+    immigrants_per_generation: int = 0,
+    preserve_resolution_diversity: bool = False,
+) -> dict[str, Any]:
+    if problem not in SCORERS:
+        raise ValueError("PatternBoost runner currently supports the three main ablation problems")
+    if control_mode not in {"patternboost", "local_only", "model_only_weak_local", "shuffled_label"}:
+        raise ValueError(f"unknown control mode: {control_mode}")
+    configured_initial_pool_size = max(population_size, int(initial_pool_size or population_size))
+    configured_immigrants = max(0, int(immigrants_per_generation))
+    configured_training_archive_limit = max(
+        1,
+        int(training_archive_limit or max(elite_size * 8, 8)),
+    )
+    if model_embed_dim <= 0 or model_num_heads <= 0 or model_num_layers <= 0 or model_batch_size <= 0:
+        raise ValueError("transformer dimensions, layers, heads, and batch size must be positive")
+    if model_embed_dim % model_num_heads != 0:
+        raise ValueError("transformer embedding width must be divisible by the number of heads")
+    if model_learning_rate <= 0:
+        raise ValueError("transformer learning rate must be positive")
+    if _resolution_diversity_active(problem, representation, preserve_resolution_diversity):
+        resolution_count = len(_unit_square_resolution_values(grid))
+        if population_size < resolution_count or elite_size < resolution_count:
+            raise ValueError(
+                "resolution diversity needs population and elite sizes at least "
+                f"the {resolution_count} available resolutions"
+            )
+    effective_train_every = train_every
+    effective_model_samples = model_samples
+    effective_model_kind = model_kind
+    effective_local_search = local_search
+    if control_mode == "local_only":
+        effective_train_every = iterations + 1
+        effective_model_samples = 0
+        effective_model_kind = "ngram"
+    elif control_mode == "model_only_weak_local":
+        effective_local_search = _weak_local_search(problem)
+    out = Path(out_dir)
+    cert_dir = out / "certificates"
+    render_dir = out / "renderings"
+    model_dir = out / "models"
+    checkpoint_path = out / "checkpoint.json"
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    render_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    event_path = out / "events.jsonl"
+    rng = random.Random(seed)
+    start_iso = datetime.now(timezone.utc).isoformat()
+    start = time.perf_counter()
+    best_cert: dict[str, Any] | None = None
+    best_path: Path | None = None
+    best_rendering_path: Path | None = None
+    time_to_best: float | None = None
+    generation_start = 0
+    exact_calls = 0
+    invalid = 0
+    nontrivial_rejected = 0
+    training_archive_pruned = 0
+    repaired = 0
+    duplicates = 0
+    model_train_calls = 0
+    model_train_seconds = 0.0
+    latest_num_training_texts = 0
+    max_num_training_texts = 0
+    latest_model_num_parameters: int | None = None
+    num_model_samples = 0
+    num_model_samples_valid = 0
+    num_random_immigrants = 0
+    num_certificate_ineligible = 0
+    fallback_floor_attempts = 0
+    fallback_floor_used = False
+    latest_model_kind = None
+    stop_reason = "completed"
+    completed_iterations = generation_start
+    constraints = _nontrivial_constraints(problem, n)
+    search_n_min = int(constraints["min_items"])
+    search_n_max = max(max(n, search_n_min) * 3, 16, search_n_min)
+    if resume and checkpoint_path.exists():
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint.get("schema") != "patternboost_checkpoint_v1":
+            raise ValueError(f"unknown checkpoint schema in {checkpoint_path}")
+        population = list(checkpoint.get("population", []))
+        nontrivial_rejected_keys = set(str(item) for item in checkpoint.get("nontrivial_rejected_candidate_ids", []))
+        loaded_archive = [
+            (float(row["surrogate_score"]), dict(row["instance"]))
+            for row in checkpoint.get("archive", [])
+            if isinstance(row, dict) and "instance" in row
+        ]
+        archive = []
+        for score, instance in loaded_archive:
+            try:
+                key = sha256_obj(decoded_geometry(instance))
+            except Exception:
+                training_archive_pruned += 1
+                continue
+            ok, _reason = _training_instance_ok(problem, instance, constraints)
+            if key in nontrivial_rejected_keys or not ok:
+                training_archive_pruned += 1
+                continue
+            archive.append((score, instance))
+        seen = set(str(item) for item in checkpoint.get("seen", []))
+        generation_start = int(checkpoint.get("next_generation", 0))
+        completed_iterations = generation_start
+        rng.setstate(_as_tuple(checkpoint["rng_state"]))
+        exact_calls = int(checkpoint.get("num_exact_calls", 0))
+        invalid = int(checkpoint.get("num_invalid_samples", 0))
+        nontrivial_rejected = int(checkpoint.get("num_nontrivial_rejected", 0))
+        repaired = int(checkpoint.get("num_repaired_samples", 0))
+        duplicates = int(checkpoint.get("num_duplicates", 0))
+        model_train_calls = int(checkpoint.get("num_model_train_calls", 0))
+        model_train_seconds = float(checkpoint.get("model_train_seconds", 0.0))
+        latest_num_training_texts = int(checkpoint.get("latest_num_training_texts", 0))
+        max_num_training_texts = int(checkpoint.get("max_num_training_texts", 0))
+        latest_model_num_parameters = checkpoint.get("latest_model_num_parameters")
+        if latest_model_num_parameters is not None:
+            latest_model_num_parameters = int(latest_model_num_parameters)
+        num_model_samples = int(checkpoint.get("num_model_samples", 0))
+        num_model_samples_valid = int(checkpoint.get("num_model_samples_valid", 0))
+        num_random_immigrants = int(checkpoint.get("num_random_immigrants", 0))
+        num_certificate_ineligible = int(checkpoint.get("num_certificate_ineligible", 0))
+        training_archive_pruned += int(checkpoint.get("num_training_archive_pruned", 0))
+        latest_model_kind = checkpoint.get("latest_model_kind")
+        time_to_best = checkpoint.get("time_to_best")
+        if checkpoint.get("best_certificate_path"):
+            best_path = Path(str(checkpoint["best_certificate_path"]))
+            if best_path.exists():
+                best_cert = json.loads(best_path.read_text(encoding="utf-8"))
+        if checkpoint.get("best_rendering_path"):
+            best_rendering_path = Path(str(checkpoint["best_rendering_path"]))
+    else:
+        population = _fresh_population(
+            problem,
+            representation,
+            rng,
+            count=configured_initial_pool_size,
+            n=search_n_min,
+            grid=grid,
+            preserve_resolution_diversity=preserve_resolution_diversity,
+        )
+        archive: list[tuple[float, dict[str, Any]]] = []
+        seen: set[str] = set()
+        nontrivial_rejected_keys: set[str] = set()
+
+    def exact_audit(
+        instance: dict[str, Any],
+        generation: int,
+        source: str,
+        *,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        nonlocal best_cert, best_path, best_rendering_path, time_to_best
+        nonlocal exact_calls, nontrivial_rejected, num_certificate_ineligible
+        clean_instance = decoded_geometry(instance)
+        try:
+            cert = SCORERS[problem].score_instance(clean_instance)
+        except Exception:
+            return None
+        exact_calls += 1
+        cert["candidate_id"] = sha256_obj(clean_instance)
+        cert["representation"] = representation
+        cert["local_search"] = local_search
+        cert["surrogate"] = surrogate
+        cert["source_type"] = source
+        cert["control_mode"] = control_mode
+        cert["generation"] = generation
+        if extra_metadata:
+            cert.update(extra_metadata)
+        cert = attach_runtime_provenance(cert, Path.cwd())
+        cert = attach_certificate_hash(cert)
+        ok, reason = _nontrivial_certificate_ok(problem, cert, constraints)
+        if not ok:
+            if _certificate_failure_allows_evolution(problem, reason):
+                num_certificate_ineligible += 1
+                cert["certificate_eligible"] = False
+                cert["certificate_ineligible_reason"] = reason
+                return cert
+            nontrivial_rejected += 1
+            nontrivial_rejected_keys.add(str(cert["candidate_id"]))
+            cert["solver_status"] = "rejected_nontriviality"
+            cert["nontriviality_rejected"] = True
+            cert["nontriviality_rejected_reason"] = reason
+            return cert
+        if best_cert is None or float(cert["score"]) > float(best_cert["score"]):
+            cert_path = cert_dir / f"best_iter{generation:06d}_{cert['certificate_hash'][:12]}.json"
+            rendering_path = render_dir / f"best_iter{generation:06d}_{cert['certificate_hash'][:12]}.svg"
+            write_json(cert_path, cert)
+            render_certificate(cert, rendering_path)
+            best_cert = cert
+            best_path = cert_path
+            best_rendering_path = rendering_path
+            time_to_best = time.perf_counter() - start
+        return cert
+
+    def purge_archive_for_training() -> None:
+        nonlocal archive, training_archive_pruned
+        kept: list[tuple[float, dict[str, Any]]] = []
+        for score, instance in archive:
+            try:
+                key = sha256_obj(decoded_geometry(instance))
+            except Exception:
+                training_archive_pruned += 1
+                continue
+            ok, _reason = _training_instance_ok(problem, instance, constraints)
+            if key in nontrivial_rejected_keys or not ok:
+                training_archive_pruned += 1
+                continue
+            kept.append((score, instance))
+        archive = kept
+
+    def make_training_texts() -> list[str]:
+        purge_archive_for_training()
+        top = _select_archive_rows(
+            archive,
+            limit=configured_training_archive_limit,
+            problem=problem,
+            representation=representation,
+            preserve_resolution_diversity=preserve_resolution_diversity,
+        )
+        if control_mode == "shuffled_label":
+            top = list(archive)
+            rng.shuffle(top)
+            top = top[:configured_training_archive_limit]
+        return [instance_to_text(instance) for _, instance in top]
+
+    def budget_exhausted() -> bool:
+        return budget_seconds is not None and budget_seconds > 0 and time.perf_counter() - start >= budget_seconds
+
+    def write_checkpoint(next_generation: int) -> None:
+        purge_archive_for_training()
+        write_json(
+            checkpoint_path,
+            {
+                "schema": "patternboost_checkpoint_v1",
+                "run_id": run_id,
+                "problem": problem,
+                "representation": representation,
+                "local_search": local_search,
+                "surrogate": surrogate,
+                "control_mode": control_mode,
+                "rng_seed": seed,
+                "next_generation": next_generation,
+                "iterations": iterations,
+                "nontrivial_constraints": constraints,
+                "search_n_min": search_n_min,
+                "search_n_max": search_n_max,
+                "population": population,
+                "archive": [
+                    {"surrogate_score": score, "instance": instance}
+                    for score, instance in _select_archive_rows(
+                        archive,
+                        limit=max(population_size * 8, 64, configured_training_archive_limit),
+                        problem=problem,
+                        representation=representation,
+                        preserve_resolution_diversity=preserve_resolution_diversity,
+                    )
+                    if sha256_obj(decoded_geometry(instance)) not in nontrivial_rejected_keys
+                ],
+                "seen": sorted(seen),
+                "nontrivial_rejected_candidate_ids": sorted(nontrivial_rejected_keys),
+                "rng_state": rng.getstate(),
+                "best_certificate_path": None if best_path is None else str(best_path),
+                "best_rendering_path": None if best_rendering_path is None else str(best_rendering_path),
+                "best_certificate_hash": None if best_cert is None else best_cert.get("certificate_hash"),
+                "best_exact_score": None if best_cert is None else best_cert.get("score"),
+                "time_to_best": time_to_best,
+                "num_exact_calls": exact_calls,
+                "num_invalid_samples": invalid,
+                "num_nontrivial_rejected": nontrivial_rejected,
+                "num_training_archive_pruned": training_archive_pruned,
+                "num_repaired_samples": repaired,
+                "num_duplicates": duplicates,
+                "num_model_train_calls": model_train_calls,
+                "model_train_seconds": model_train_seconds,
+                "latest_num_training_texts": latest_num_training_texts,
+                "max_num_training_texts": max_num_training_texts,
+                "latest_model_num_parameters": latest_model_num_parameters,
+                "num_model_samples": num_model_samples,
+                "num_model_samples_valid": num_model_samples_valid,
+                "num_random_immigrants": num_random_immigrants,
+                "num_certificate_ineligible": num_certificate_ineligible,
+                "initial_pool_size": configured_initial_pool_size,
+                "immigrants_per_generation": configured_immigrants,
+                "preserve_resolution_diversity": preserve_resolution_diversity,
+                "latest_model_kind": latest_model_kind,
+                "stop_reason": stop_reason,
+                "completed_iterations": completed_iterations,
+            },
+        )
+
+    event_mode = "a" if resume and checkpoint_path.exists() else "w"
+    with event_path.open(event_mode, encoding="utf-8", buffering=1) as events:
+        if generation_start:
+            events.write(json.dumps({
+                "schema": "resume_event_v1",
+                "time": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                "checkpoint": str(checkpoint_path),
+                "generation_start": generation_start,
+            }, sort_keys=True) + "\n")
+        for generation in range(generation_start, iterations):
+            if budget_exhausted():
+                stop_reason = "budget_exhausted"
+                events.write(json.dumps({
+                    "schema": "stop_event_v1",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "reason": stop_reason,
+                    "generation": generation,
+                    "elapsed_seconds": time.perf_counter() - start,
+                    "budget_seconds": budget_seconds,
+                }, sort_keys=True) + "\n")
+                write_checkpoint(generation)
+                break
+            scored: list[tuple[float, dict[str, Any], dict[str, Any], str, str]] = []
+            for instance in population:
+                try:
+                    before_geometry = decoded_geometry(instance)
+                    candidate = repair_instance_for_representation(
+                        problem,
+                        representation,
+                        instance,
+                        grid=grid,
+                        n_min=search_n_min,
+                        n_max=search_n_max,
+                    )
+                except Exception:
+                    invalid += 1
+                    continue
+                if decoded_geometry(candidate) != before_geometry:
+                    repaired += 1
+                source = instance.get("_source_type", candidate.get("_source_type", "initial_or_local"))
+                if source:
+                    candidate["_source_type"] = source
+                if instance.get("_immigrant_generation") is not None:
+                    candidate["_immigrant_generation"] = int(instance["_immigrant_generation"])
+                clean_instance = decoded_geometry(candidate)
+                key = sha256_obj(clean_instance)
+                if key in seen:
+                    duplicates += 1
+                    continue
+                seen.add(key)
+                try:
+                    row = surrogate_score(problem, surrogate, clean_instance)
+                except Exception as exc:
+                    invalid += 1
+                    events.write(json.dumps({
+                        "schema": "candidate_event_v1",
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "run_id": run_id,
+                        "problem": problem,
+                        "control_mode": control_mode,
+                        "generation": generation,
+                        "candidate_id": key,
+                        "source_type": source,
+                        "exact_status": "invalid",
+                        "error": repr(exc),
+                    }, sort_keys=True) + "\n")
+                    continue
+                ok, reason = _nontrivial_surrogate_ok(problem, clean_instance, row.get("features", {}), constraints)
+                if not ok:
+                    nontrivial_rejected += 1
+                    events.write(json.dumps({
+                        "schema": "candidate_event_v1",
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "run_id": run_id,
+                        "problem": problem,
+                        "representation": representation,
+                        "local_search": local_search,
+                        "surrogate": surrogate,
+                        "control_mode": control_mode,
+                        "generation": generation,
+                        "candidate_id": key,
+                        "source_type": source,
+                        "exact_status": "rejected_nontriviality",
+                        "rejected_reason": reason,
+                        "surrogate_features": row.get("features", {}),
+                    }, sort_keys=True) + "\n")
+                    continue
+                s_score = float(row["surrogate_score"])
+                scored.append((s_score, candidate, row["features"], key, source))
+                archive.append((s_score, candidate))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            elites = _select_elites(
+                scored,
+                elite_size=max(1, elite_size),
+                problem=problem,
+                representation=representation,
+                preserve_resolution_diversity=preserve_resolution_diversity,
+                local_search=effective_local_search,
+            )
+
+            if generation % max(1, exact_every) == 0 or generation == iterations - 1:
+                for rank, (s_score, instance, features, key, source) in enumerate(elites):
+                    cert = exact_audit(instance, generation, source)
+                    events.write(json.dumps({
+                        "schema": "candidate_event_v1",
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "run_id": run_id,
+                        "problem": problem,
+                        "representation": representation,
+                        "local_search": local_search,
+                        "surrogate": surrogate,
+                        "control_mode": control_mode,
+                        "generation": generation,
+                        "rank": rank,
+                        "candidate_id": key,
+                        "source_type": source,
+                        "surrogate_score": s_score,
+                        "surrogate_features": features,
+                        "exact_status": None if cert is None else cert["solver_status"],
+                        "exact_score": None if cert is None else cert["score"],
+                        "best_exact_score": None if best_cert is None else best_cert["score"],
+                    }, sort_keys=True) + "\n")
+                    if cert is not None and cert.get("nontriviality_rejected"):
+                        archive = [
+                            (score, archived_instance)
+                            for score, archived_instance in archive
+                            if sha256_obj(decoded_geometry(archived_instance)) != key
+                        ]
+
+            elites = [item for item in elites if item[3] not in nontrivial_rejected_keys]
+            next_population = [instance for _, instance, _, _, _ in elites]
+            if generation > 0 and generation % max(1, effective_train_every) == 0 and archive and next_population:
+                texts = make_training_texts()
+                if not texts:
+                    events.write(json.dumps({
+                        "schema": "model_event_v1",
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "run_id": run_id,
+                        "generation": generation,
+                        "model_kind": effective_model_kind,
+                        "control_mode": control_mode,
+                        "skipped": "no_large_training_examples",
+                    }, sort_keys=True) + "\n")
+                else:
+                    try:
+                        train_started = time.perf_counter()
+                        model = train_model(
+                            texts,
+                            model_kind=effective_model_kind,
+                            seed=seed + generation,
+                            epochs=model_epochs,
+                            block_size=block_size,
+                            embed_dim=model_embed_dim,
+                            num_heads=model_num_heads,
+                            num_layers=model_num_layers,
+                            batch_size=model_batch_size,
+                            learning_rate=model_learning_rate,
+                        )
+                        train_elapsed = time.perf_counter() - train_started
+                        model_train_seconds += train_elapsed
+                        latest_model_kind = model.model_kind
+                        latest_num_training_texts = len(texts)
+                        max_num_training_texts = max(max_num_training_texts, len(texts))
+                        latest_model_num_parameters = model.metadata.get("num_parameters")
+                        model_train_calls += 1
+                        artifact_keep = _model_artifact_keep()
+                        if artifact_keep:
+                            save_model_artifacts(model, model_dir / f"gen{generation:06d}_{model.model_kind}")
+                            _prune_model_artifacts(model_dir, keep=artifact_keep)
+                        sampled = sample_model(model, rng, count=effective_model_samples, max_tokens=block_size * 4)
+                        num_model_samples += effective_model_samples
+                        for sample in sampled:
+                            if not isinstance(sample, dict):
+                                invalid += 1
+                                continue
+                            try:
+                                before_geometry = decoded_geometry(sample)
+                                clean_sample = repair_instance_for_representation(
+                                    problem,
+                                    representation,
+                                    sample,
+                                    grid=grid,
+                                    n_min=search_n_min,
+                                    n_max=search_n_max,
+                                )
+                            except Exception:
+                                invalid += 1
+                                continue
+                            if decoded_geometry(clean_sample) != before_geometry:
+                                repaired += 1
+                            if clean_sample.get("schema") != next_population[0].get("schema"):
+                                invalid += 1
+                                continue
+                            try:
+                                sample_row = surrogate_score(problem, surrogate, decoded_geometry(clean_sample))
+                            except Exception:
+                                invalid += 1
+                                continue
+                            ok, reason = _nontrivial_surrogate_ok(
+                                problem,
+                                decoded_geometry(clean_sample),
+                                sample_row.get("features", {}),
+                                constraints,
+                            )
+                            if not ok:
+                                nontrivial_rejected += 1
+                                continue
+                            clean_sample["_source_type"] = "model_sample"
+                            next_population.append(clean_sample)
+                            num_model_samples_valid += 1
+                        events.write(json.dumps({
+                            "schema": "model_event_v1",
+                            "time": datetime.now(timezone.utc).isoformat(),
+                            "run_id": run_id,
+                            "generation": generation,
+                            "model_kind": model.model_kind,
+                            "num_training_texts": len(texts),
+                            "training_seconds": train_elapsed,
+                            "model_metadata": model.metadata,
+                            "num_requested_samples": effective_model_samples,
+                            "num_valid_samples_total": num_model_samples_valid,
+                            "control_mode": control_mode,
+                        }, sort_keys=True) + "\n")
+                    except Exception as exc:
+                        events.write(json.dumps({
+                            "schema": "model_event_v1",
+                            "time": datetime.now(timezone.utc).isoformat(),
+                            "run_id": run_id,
+                            "generation": generation,
+                            "model_kind": effective_model_kind,
+                            "control_mode": control_mode,
+                            "error": repr(exc),
+                        }, sort_keys=True) + "\n")
+
+            immigrant_count = min(
+                configured_immigrants,
+                max(0, population_size - len(next_population)),
+            )
+            mutation_target = population_size - immigrant_count
+            mutation_parents = list(next_population)
+            rng.shuffle(mutation_parents)
+            mutation_parent_index = 0
+            while len(next_population) < mutation_target:
+                if not next_population:
+                    fresh = initial_instance_for_representation(problem, representation, rng, n=search_n_min, grid=grid)
+                    fresh["_source_type"] = "random_reseed"
+                    next_population.append(fresh)
+                    continue
+                if mutation_parent_index < len(mutation_parents):
+                    parent = mutation_parents[mutation_parent_index]
+                    mutation_parent_index += 1
+                else:
+                    parent = rng.choice(next_population)
+                try:
+                    mate = None
+                    if effective_local_search == DIVERSE_ANNEALED_LOCAL_SEARCH:
+                        same_resolution = [
+                            candidate
+                            for candidate in mutation_parents
+                            if candidate is not parent
+                            and _resolution_bucket(candidate) == _resolution_bucket(parent)
+                        ]
+                        if same_resolution:
+                            mate = rng.choice(same_resolution)
+                    child = mutate_instance(
+                        problem,
+                        effective_local_search,
+                        parent,
+                        rng,
+                        grid=grid,
+                        n_min=search_n_min,
+                        n_max=search_n_max,
+                        representation=representation,
+                        mate=mate,
+                    )
+                except Exception:
+                    invalid += 1
+                    child = initial_instance_for_representation(problem, representation, rng, n=search_n_min, grid=grid)
+                    child["_source_type"] = "random_reseed"
+                    next_population.append(child)
+                    continue
+                child["_source_type"] = "local_mutation"
+                child.pop("_immigrant_generation", None)
+                next_population.append(child)
+            if immigrant_count:
+                immigrants = _fresh_population(
+                    problem,
+                    representation,
+                    rng,
+                    count=immigrant_count,
+                    n=search_n_min,
+                    grid=grid,
+                    preserve_resolution_diversity=preserve_resolution_diversity,
+                    resolution_offset=generation * immigrant_count,
+                )
+                for immigrant in immigrants:
+                    immigrant["_source_type"] = "random_immigrant"
+                    immigrant["_immigrant_generation"] = generation
+                next_population.extend(immigrants)
+                num_random_immigrants += len(immigrants)
+            population = next_population[:population_size]
+            completed_iterations = generation + 1
+            if (generation + 1) % max(1, checkpoint_every) == 0 or generation == iterations - 1:
+                write_checkpoint(generation + 1)
+        else:
+            completed_iterations = iterations
+
+    def guillotine_floor_candidates():
+        if problem != "guillotine":
+            return
+        # First try the row's own representation. Pure random disjoint layouts
+        # are usually easy to slice, but this keeps the fallback honest.
+        for _attempt in range(8):
+            candidate = initial_instance_for_representation(
+                "guillotine",
+                representation,
+                rng,
+                n=search_n_min,
+                grid=grid,
+            )
+            candidate = repair_instance_for_representation(
+                "guillotine",
+                representation,
+                candidate,
+                grid=grid,
+                n_min=search_n_min,
+                n_max=search_n_max,
+            )
+            yield candidate, "fallback_floor_row_random", None
+
+        # If a row would otherwise export nothing, use the same randomized
+        # structural guillotine generator already present in the search space,
+        # then re-encode it through the row representation. This is labelled so
+        # downstream analysis can distinguish it from a row-discovered best.
+        for _attempt in range(4):
+            candidate = initial_instance_for_representation(
+                "guillotine",
+                "recursive_obstruction_grammar",
+                rng,
+                n=search_n_min,
+                grid=grid,
+            )
+            candidate = repair_instance_for_representation(
+                "guillotine",
+                representation,
+                candidate,
+                grid=grid,
+                n_min=search_n_min,
+                n_max=search_n_max,
+            )
+            yield candidate, "fallback_floor_structural_random", {
+                "fallback_floor": True,
+                "fallback_source_representation": "recursive_obstruction_grammar",
+                "fallback_row_representation": representation,
+            }
+
+    if best_cert is None and problem == "guillotine":
+        with event_path.open("a", encoding="utf-8") as events:
+            for candidate, source, metadata in guillotine_floor_candidates() or []:
+                fallback_floor_attempts += 1
+                cert = exact_audit(
+                    candidate,
+                    completed_iterations,
+                    source,
+                    extra_metadata=metadata,
+                )
+                events.write(json.dumps({
+                    "schema": "fallback_floor_event_v1",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "problem": problem,
+                    "representation": representation,
+                    "local_search": local_search,
+                    "surrogate": surrogate,
+                    "generation": completed_iterations,
+                    "source_type": source,
+                    "exact_status": None if cert is None else cert["solver_status"],
+                    "exact_score": None if cert is None else cert["score"],
+                    "best_exact_score": None if best_cert is None else best_cert["score"],
+                }, sort_keys=True) + "\n")
+                if best_cert is not None:
+                    fallback_floor_used = True
+                    write_checkpoint(completed_iterations)
+                    break
+
+    summary = {
+        "schema": "run_summary_v1",
+        "run_id": run_id,
+        "stage": stage,
+        "problem": problem,
+        "representation": representation,
+        "local_search": local_search,
+        "surrogate": surrogate,
+        "control_mode": control_mode,
+        "rng_seed": seed,
+        "iterations": iterations,
+        "completed_iterations": completed_iterations,
+        "stop_reason": stop_reason,
+        "population_size": population_size,
+        "initial_pool_size": configured_initial_pool_size,
+        "training_archive_limit": configured_training_archive_limit,
+        "immigrants_per_generation": configured_immigrants,
+        "preserve_resolution_diversity": preserve_resolution_diversity,
+        "elite_size": elite_size,
+        "exact_every": exact_every,
+        "train_every": train_every,
+        "model_samples": model_samples,
+        "model_epochs": model_epochs,
+        "block_size": block_size,
+        "model_embed_dim": model_embed_dim,
+        "model_num_heads": model_num_heads,
+        "model_num_layers": model_num_layers,
+        "model_batch_size": model_batch_size,
+        "model_learning_rate": model_learning_rate,
+        "effective_train_every": effective_train_every,
+        "effective_model_samples": effective_model_samples,
+        "effective_local_search": effective_local_search,
+        "model_hparams": {
+            "model_kind_requested": effective_model_kind,
+            "model_kind_latest": latest_model_kind,
+            "epochs": model_epochs,
+            "block_size": block_size,
+            "embed_dim": model_embed_dim,
+            "num_heads": model_num_heads,
+            "num_layers": model_num_layers,
+            "batch_size": model_batch_size,
+            "learning_rate": model_learning_rate,
+            "latest_num_parameters": latest_model_num_parameters,
+        },
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_every": checkpoint_every,
+        "resumed_from_checkpoint": bool(resume and generation_start > 0),
+        "n": n,
+        "grid": grid,
+        "search_n_min": search_n_min,
+        "search_n_max": search_n_max,
+        "budget_seconds": budget_seconds,
+        "start_time": start_iso,
+        "end_time": datetime.now(timezone.utc).isoformat(),
+        "return_code": 0,
+        "best_exact_score": None if best_cert is None else best_cert["score"],
+        "time_to_best": time_to_best,
+        "best_certificate_path": None if best_path is None else str(best_path),
+        "best_rendering_path": None if best_rendering_path is None else str(best_rendering_path),
+        "best_certificate_hash": None if best_cert is None else best_cert["certificate_hash"],
+        "num_exact_calls": exact_calls,
+        "num_exact_timeouts": 0,
+        "num_invalid_samples": invalid,
+        "num_nontrivial_rejected": nontrivial_rejected,
+        "num_training_archive_pruned": training_archive_pruned,
+        "nontrivial_constraints": constraints,
+        "num_repaired_samples": repaired,
+        "num_duplicates": duplicates,
+        "num_model_train_calls": model_train_calls,
+        "model_train_seconds": model_train_seconds,
+        "latest_num_training_texts": latest_num_training_texts,
+        "max_num_training_texts": max_num_training_texts,
+        "latest_model_num_parameters": latest_model_num_parameters,
+        "num_model_samples": num_model_samples,
+        "num_model_samples_valid": num_model_samples_valid,
+        "num_random_immigrants": num_random_immigrants,
+        "num_certificate_ineligible": num_certificate_ineligible,
+        "fallback_floor_attempts": fallback_floor_attempts,
+        "fallback_floor_used": fallback_floor_used,
+        "num_exports": len(list(cert_dir.glob("*.json"))),
+        "event_stream": str(event_path),
+        "elapsed_seconds": time.perf_counter() - start,
+    }
+    write_json(out / "summary.json", summary)
+    return summary
+
+
+def _weak_local_search(problem: str) -> str:
+    return {
+        "misr": "coord_anneal",
+        "unit_square": "coord_mutation",
+        "guillotine": "packing_resize",
+    }[problem]
+
+
+def _nontrivial_constraints(problem: str, requested_n: int) -> dict[str, Any]:
+    base = max(2, int(requested_n))
+    large = LARGE_EXAMPLE_CONSTRAINTS.get(problem, {})
+    if problem == "misr":
+        return {
+            "min_items": max(int(large["min_items"]), base),
+        }
+    if problem == "unit_square":
+        return {
+            "min_items": max(int(large["min_items"]), base),
+            "min_tau_int": int(large["min_tau_int"]),
+        }
+    if problem == "guillotine":
+        return {
+            "min_items": max(int(large["min_items"]), base),
+            "min_destroyed": int(large["min_destroyed"]),
+        }
+    return {"min_items": base}
+
+
+def _instance_item_count(problem: str, instance: dict[str, Any]) -> int:
+    if problem == "misr":
+        return len(instance.get("rectangles") or [])
+    if problem == "unit_square":
+        return len(instance.get("squares") or [])
+    if problem == "guillotine":
+        return len(instance.get("rectangles") or [])
+    return 0
+
+
+def _training_instance_ok(
+    problem: str,
+    instance: dict[str, Any],
+    constraints: dict[str, Any],
+) -> tuple[bool, str | None]:
+    try:
+        clean_instance = decoded_geometry(instance)
+    except Exception:
+        return False, "invalid_geometry"
+    min_items = int(constraints.get("min_items", 2))
+    n_items = _instance_item_count(problem, clean_instance)
+    if n_items < min_items:
+        return False, f"training_item_count_below_{min_items}"
+    return True, None
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nontrivial_surrogate_ok(
+    problem: str,
+    instance: dict[str, Any],
+    features: dict[str, Any],
+    constraints: dict[str, Any],
+) -> tuple[bool, str | None]:
+    min_items = int(constraints.get("min_items", 2))
+    n_items = _instance_item_count(problem, instance)
+    if n_items < min_items:
+        return False, f"item_count_below_{min_items}"
+
+    return True, None
+
+
+def _nontrivial_certificate_ok(
+    problem: str,
+    cert: dict[str, Any],
+    constraints: dict[str, Any],
+) -> tuple[bool, str | None]:
+    min_items = int(constraints.get("min_items", 2))
+    if problem == "unit_square":
+        n_items = len(cert.get("squares") or [])
+        if n_items < min_items:
+            return False, f"item_count_below_{min_items}"
+        tau_int = _as_int(cert.get("tau_int"))
+        min_tau = int(constraints.get("min_tau_int", 0))
+        if tau_int is not None and tau_int < min_tau:
+            return False, f"stabbing_integer_cover_below_{min_tau}"
+    elif problem == "guillotine":
+        n_items = _as_int(cert.get("n"))
+        if n_items is None:
+            n_items = len(cert.get("rectangles") or [])
+        if n_items < min_items:
+            return False, f"item_count_below_{min_items}"
+        destroyed = _as_int(cert.get("destroyed"))
+        min_destroyed = int(constraints.get("min_destroyed", 0))
+        if destroyed is not None and destroyed < min_destroyed:
+            return False, f"destroyed_below_{min_destroyed}"
+    else:
+        # MISR certificates use rectangles; the size gate is enough here.
+        n_items = len(cert.get("rectangles") or [])
+        if n_items < min_items:
+            return False, f"item_count_below_{min_items}"
+    return True, None
