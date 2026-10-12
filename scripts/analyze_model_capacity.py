@@ -43,6 +43,18 @@ def _format_seconds(value: Any) -> str:
     return "missing" if value in {None, ""} else f"{float(value):.1f}"
 
 
+def _reference_score(spec: dict[str, Any]) -> Any:
+    """Row's reference score; fall back to the registry if the matrix row lacks it."""
+    if spec.get("reference_score") is not None:
+        return spec["reference_score"]
+    from multilevel.components import MODEL_CAPACITY_TOP_CONFIGS
+
+    for cell in MODEL_CAPACITY_TOP_CONFIGS.get(str(spec["problem"]), ()):
+        if all(cell[k] == spec[k] for k in ("representation", "local_search", "surrogate")):
+            return cell["reference_score"]
+    return None
+
+
 def build_rows(matrix: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for spec in matrix:
@@ -55,7 +67,7 @@ def build_rows(matrix: list[dict[str, Any]], summaries: dict[str, dict[str, Any]
                 "local_search": spec["local_search"],
                 "surrogate": spec["surrogate"],
                 "experiment_arm": spec["experiment_arm"],
-                "reference_score": spec["reference_score"],
+                "reference_score": _reference_score(spec),
                 "best_exact_score": summary.get("best_exact_score"),
                 "stop_reason": summary.get("stop_reason", "missing"),
                 "completed_iterations": summary.get("completed_iterations"),

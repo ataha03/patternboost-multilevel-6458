@@ -75,6 +75,11 @@ Expected row count: `12`.
 
 ## 4. Generate a Slurm Array
 
+To reproduce the paper's final 81 cells (rather than the original design from step 3), generate the matrix with
+`PYTHONPATH=src python3 -m multilevel.cli final-81-matrix --out runs/final_81_matrix.jsonl` and use that file as
+`--matrix` below. Each row then carries its own cohort's settings (see `ARTIFACT_EVALUATION.md`, Mode 5).
+`make-slurm` runs up to 10^6 generations (`ITERATIONS` overrides) and stops at the row's wall-clock budget.
+
 ```bash
 PYTHONPATH=src python3 -m multilevel.cli make-slurm \
   --matrix runs/main_81_matrix.jsonl \

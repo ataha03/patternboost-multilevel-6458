@@ -17,6 +17,17 @@ scripts/make_main_matrix.sh
 
 The output is `runs/main_81_matrix.jsonl`.
 
+> **Paper's final table.** `matrix --stage main` generates the *original* 81-cell design. The paper's
+> final 81 cells use the replacement design (e.g. the unit-square winner uses
+> `symmetry_crossover_hillclimb`) and three runtime cohorts. To generate that table, with each cell's own
+> cohort settings and the 24 h budget, use:
+>
+> ```bash
+> PYTHONPATH=src python3 -m multilevel.cli final-81-matrix --out runs/final_81_matrix.jsonl
+> ```
+>
+> and pass `runs/final_81_matrix.jsonl` to `make-slurm`. See `ARTIFACT_EVALUATION.md` (Mode 5) for the cohorts.
+
 ## Problems and Components
 
 ### MISR

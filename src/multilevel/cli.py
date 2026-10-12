@@ -17,6 +17,7 @@ from multilevel.components import (
     MODEL_CAPACITY_TOP_CONFIGS,
     REPLACEMENT_COMPONENTS,
     build_control_matrix,
+    build_final_81_matrix,
     build_matrix,
     build_model_capacity_matrix,
     build_replacement_delta_matrix,
@@ -74,6 +75,18 @@ def cmd_matrix(args: argparse.Namespace) -> int:
         budget_seconds=int(budget),
         git_commit=commit,
         problems=args.problem,
+    )
+    out = Path(args.out)
+    _write_jsonl(out, rows)
+    print(f"wrote {len(rows)} rows to {out}")
+    return 0
+
+
+def cmd_final_81_matrix(args: argparse.Namespace) -> int:
+    rows = build_final_81_matrix(
+        stage=args.stage,
+        budget_seconds=int(args.budget_seconds),
+        git_commit=args.git_commit or "",
     )
     out = Path(args.out)
     _write_jsonl(out, rows)
@@ -565,6 +578,16 @@ def build_parser() -> argparse.ArgumentParser:
     capacity_matrix.add_argument("--problem", action="append", choices=sorted(MODEL_CAPACITY_TOP_CONFIGS), default=None)
     capacity_matrix.add_argument("--out", default="runs/model_capacity_matrix.jsonl")
     capacity_matrix.set_defaults(func=cmd_model_capacity_matrix)
+
+    final_81 = sub.add_parser(
+        "final-81-matrix",
+        help="Write the paper's final 81-cell matrix, each cell with its own cohort settings.",
+    )
+    final_81.add_argument("--stage", default="main")
+    final_81.add_argument("--budget-seconds", type=int, default=86400)
+    final_81.add_argument("--git-commit", default=None)
+    final_81.add_argument("--out", default="runs/final_81_matrix.jsonl")
+    final_81.set_defaults(func=cmd_final_81_matrix)
 
     square_restart_matrix = sub.add_parser(
         "unit-square-restart-matrix",

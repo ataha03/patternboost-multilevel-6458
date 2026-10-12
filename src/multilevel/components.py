@@ -391,6 +391,84 @@ def build_matrix(
     return rows
 
 
+RETAINED_RUNTIME_OVERRIDES: dict[str, int] = {
+    "n": 8,
+    "grid": 8,
+    "population": 32,
+    "elite": 6,
+    "initial_pool_size": 32,
+    "immigrants_per_generation": 0,
+    "train_every": 7,
+}
+
+
+def build_final_81_matrix(
+    *,
+    stage: str = "main",
+    budget_seconds: int = 86_400,
+    git_commit: str = "",
+) -> list[dict[str, object]]:
+    """Build the paper's final 81-cell table with each cell's own cohort settings.
+
+    The final table was assembled from three runtime cohorts (see
+    docs/COLLABORATOR_EXPERIMENT_DETAILS.md):
+
+    - retained (36 cells; representation and local search both from the original
+      design): n=8, grid 8, population 32, elite 6, training every 7 generations;
+    - replacement (42 cells): MISR/guillotine n=12, grid 8; unit square n=20,
+      grid 16; population 16, elite 4, training every 10 generations;
+    - unit-square resolution follow-up (3 cells: sqstab_exact_grid with
+      symmetry_crossover_hillclimb): population 32, elite 12, initial pool 128,
+      4 immigrants per generation, resolution-island retention.
+
+    This rule reproduces `source_cohort` and `population_size` in
+    docs/assets/replacement_81_final_20260712/data/final_81_runs.csv for all 81 rows.
+    `iterations` is left out so the runner's --iterations applies.
+    """
+    rows: list[dict[str, object]] = []
+    for problem, comp in REPLACEMENT_COMPONENTS.items():
+        old = COMPONENTS[problem]
+        replacement_runtime = dict(REPLACEMENT_RUNTIME_PARAMETERS)
+        replacement_runtime.update(
+            {k: v for k, v in REPLACEMENT_RUNTIME_OVERRIDES.get(problem, {}).items() if k in ("n", "grid")}
+        )
+        for representation, local_search, surrogate in product(
+            comp.representations, comp.local_search, comp.surrogates
+        ):
+            cell = {
+                "representation": representation,
+                "local_search": local_search,
+                "surrogate": surrogate,
+            }
+            if representation in old.representations and local_search in old.local_search:
+                runtime = {**REPLACEMENT_RUNTIME_PARAMETERS, **RETAINED_RUNTIME_OVERRIDES}
+            else:
+                runtime = dict(replacement_runtime)
+                if (
+                    problem == "unit_square"
+                    and representation == "sqstab_exact_grid"
+                    and local_search == "symmetry_crossover_hillclimb"
+                ):
+                    runtime.update(UNIT_SQUARE_DIVERSITY_PARAMETERS)
+            runtime.pop("iterations", None)
+            rows.append(
+                {
+                    "schema": "run_matrix_row_v1",
+                    "run_id": make_run_id(
+                        problem=problem, **cell, budget_seconds=budget_seconds, git_commit=git_commit
+                    ),
+                    "stage": stage,
+                    "rng_seed": fresh_rng_seed(),
+                    "budget_seconds": budget_seconds,
+                    "git_commit": git_commit or None,
+                    "problem": problem,
+                    **cell,
+                    **runtime,
+                }
+            )
+    return rows
+
+
 def build_model_capacity_matrix(
     *,
     stage: str,

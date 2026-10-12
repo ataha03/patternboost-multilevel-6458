@@ -105,6 +105,11 @@ PYTHONPATH=src python3 -m multilevel.cli audit --root runs/local_test --out runs
 
 ## NYUAD Jubail HPC
 
+To reproduce the paper's final 81 cells, generate the matrix with
+`PYTHONPATH=src python3 -m multilevel.cli final-81-matrix --out runs/final_81_matrix.jsonl` and pass it to
+`make-slurm` instead of `runs/main_81_matrix.jsonl` (the original design). Each row carries its own cohort's
+settings; see `ARTIFACT_EVALUATION.md` (Mode 5).
+
 The short version is:
 
 ```bash

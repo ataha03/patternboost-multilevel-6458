@@ -56,11 +56,11 @@ def write_slurm_array(
     if runner == "patternboost":
         command = "patternboost-cell"
         extra = (
-            "--iterations ${ITERATIONS:-100} "
+            "--iterations ${ITERATIONS:-1000000} "
             "--population ${POPULATION:-32} "
             "--elite ${ELITE:-6} "
             "--exact-every ${EXACT_EVERY:-5} "
-            "--train-every ${TRAIN_EVERY:-10} "
+            "--train-every ${TRAIN_EVERY:-7} "
             "--model-samples ${MODEL_SAMPLES:-16} "
             "--model-kind ${MODEL_KIND:-auto} "
             "--model-epochs ${MODEL_EPOCHS:-3} "
@@ -133,7 +133,7 @@ python3 -m multilevel.cli {command} \\
   --index "${{SLURM_ARRAY_TASK_ID}}" \\
   --out-root {shlex.quote(results)} \\
   {extra} \\
-  --n "${{N:-12}}" \\
+  --n "${{N:-8}}" \\
   --grid "${{GRID:-8}}"
 """
     target = Path(out_path)
