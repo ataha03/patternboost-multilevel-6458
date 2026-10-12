@@ -224,3 +224,5 @@ PYTHONPATH=src python3 -m multilevel.cli patternboost-cell \
 For a conceptual map of the 81 rows, see
 [docs/EXPERIMENT_MATRIX.md](docs/EXPERIMENT_MATRIX.md). For day-to-day
 handoff instructions, see [docs/HANDOFF.md](docs/HANDOFF.md).
+
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
