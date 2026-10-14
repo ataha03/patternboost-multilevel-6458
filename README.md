@@ -35,16 +35,14 @@ docs/                   handoff docs, current results, archived notes
 runs/                   ignored local/HPC output directory
 ```
 
-Generated artifacts are intentionally ignored by git. The old local run/output
-folders from the working session were preserved in `.local_artifacts/` and are
-not meant to be pushed.
+Generated artifacts are intentionally ignored by git.
 
 ## Setup
 
 Use Python 3.10 or newer. Python 3.11 is recommended.
 
 ```bash
-cd multi-level
+cd <repository directory>
 python3 --version
 python3 -m venv .venv
 source .venv/bin/activate
@@ -66,35 +64,49 @@ Run the fast checks:
 
 ```bash
 pytest -q
-PYTHONPATH=src python3 -m multilevel.cli smoke --out runs/smoke
+python3 reproduce.py --mode smoke
 ```
 
-## First Local Run
+## Reproducing the Paper
 
-Generate the current 81-row, no-seed main matrix:
+`reproduce.py` is the single entry point. See
+[ARTIFACT_EVALUATION.md](ARTIFACT_EVALUATION.md) for the full guide.
 
 ```bash
-scripts/make_main_matrix.sh
+python3 reproduce.py --mode verify                      # re-verify all 81 certificates (minutes)
+python3 reproduce.py --mode smoke                       # score and verify small examples (minutes)
+python3 reproduce.py --mode single --problem misr --iterations 200   # best cell of one problem
+python3 reproduce.py --mode figures                     # regenerate figures and tables
+python3 reproduce.py --mode full --iterations 1000000   # all 81 cells (cluster scale)
+```
+
+`--problem` is `misr`, `unit_square` or `guillotine`. Each run uses the best
+configuration of that problem with the settings reported in the paper, and starts
+from a fresh random seed, so scores vary between runs; a short run will usually
+not reach the paper's best value. Use `--mode verify` to check the reported
+constructions exactly.
+
+## Running Cells Directly
+
+Generate the paper's final 81-cell matrix. Each row carries its own settings
+(size, population, elite size, training interval):
+
+```bash
+PYTHONPATH=src python3 -m multilevel.cli final-81-matrix --out runs/final_81_matrix.jsonl
 ```
 
 Run one PatternBoost cell locally:
 
 ```bash
 PYTHONPATH=src python3 -m multilevel.cli patternboost-cell \
-  --matrix runs/main_81_matrix.jsonl \
+  --matrix runs/final_81_matrix.jsonl \
   --index 0 \
   --out-root runs/local_test \
   --iterations 20 \
-  --population 16 \
-  --elite 4 \
-  --exact-every 5 \
-  --train-every 5 \
-  --model-samples 4 \
-  --model-kind ngram \
-  --checkpoint-every 1 \
-  --n 8 \
-  --grid 8
+  --model-kind ngram
 ```
+
+Settings stored in a matrix row take precedence over command-line flags.
 
 Collect and audit results:
 
@@ -103,39 +115,30 @@ PYTHONPATH=src python3 -m multilevel.cli summary --root runs/local_test --out ru
 PYTHONPATH=src python3 -m multilevel.cli audit --root runs/local_test --out runs/local_test/audit/audit.json --csv runs/local_test/audit/audit.csv
 ```
 
-## NYUAD Jubail HPC
+## Slurm Cluster
 
-To reproduce the paper's final 81 cells, generate the matrix with
-`PYTHONPATH=src python3 -m multilevel.cli final-81-matrix --out runs/final_81_matrix.jsonl` and pass it to
-`make-slurm` instead of `runs/main_81_matrix.jsonl` (the original design). Each row carries its own cohort's
-settings; see `ARTIFACT_EVALUATION.md` (Mode 5).
-
-The short version is:
+The paper's runs used one 24-hour cell per Slurm array task (4 cores, 16 GB each).
+On the cluster, from the repository directory:
 
 ```bash
-scripts/sync_to_hpc.sh
-ssh sg9396@jubail.abudhabi.nyu.edu
-cd ~/patternboost/multi-level
-scripts/prepare_hpc_scratch_venv.sh
-scripts/make_main_matrix.sh
+PYTHONPATH=src python3 -m multilevel.cli final-81-matrix \
+  --budget-seconds 86400 --out runs/final_81_matrix.jsonl
 PYTHONPATH=src python3 -m multilevel.cli make-slurm \
-  --matrix runs/main_81_matrix.jsonl \
-  --out scripts/main_81_array.slurm \
+  --matrix runs/final_81_matrix.jsonl \
+  --out scripts/final_81_array.slurm \
   --project-dir "$PWD" \
-  --results-dir runs/main_81_hpc \
-  --time 04:30:00 \
-  --partition compute \
+  --results-dir runs/final_81_hpc \
+  --time 25:00:00 \
+  --partition <partition> \
   --cpus-per-task 4 \
   --mem 16G \
   --runner patternboost
-VENV=/scratch/$USER/pb_multilevel_venv sbatch scripts/main_81_array.slurm
+sbatch scripts/final_81_array.slurm
 ```
 
-Monitor the run:
-
-```bash
-scripts/monitor_hpc_run.sh JOB_ID runs/main_81_hpc
-```
+Each cell runs until its 24-hour budget or 10^6 generations. Collect and audit the
+results with the `summary` and `audit` commands shown above, and monitor a run with
+`scripts/monitor_hpc_run.sh JOB_ID runs/final_81_hpc`.
 
 See [docs/HPC_JUBAIL.md](docs/HPC_JUBAIL.md) for the full step-by-step HPC
 workflow, including smoke tests, generated Slurm arrays, exploratory runs,
@@ -214,7 +217,7 @@ Resume a checkpointed cell:
 
 ```bash
 PYTHONPATH=src python3 -m multilevel.cli patternboost-cell \
-  --matrix runs/main_81_matrix.jsonl \
+  --matrix runs/final_81_matrix.jsonl \
   --index 0 \
   --out-root runs/local_test \
   --iterations 200 \
@@ -225,4 +228,4 @@ For a conceptual map of the 81 rows, see
 [docs/EXPERIMENT_MATRIX.md](docs/EXPERIMENT_MATRIX.md). For day-to-day
 handoff instructions, see [docs/HANDOFF.md](docs/HANDOFF.md).
 
-License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+License: [MIT](LICENSE)
