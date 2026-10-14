@@ -200,8 +200,19 @@ python reproduce.py --mode single --problem unit_square --iterations 5000
 
 Each problem's best cell runs with the settings of its own cohort (see Mode 5): MISR and guillotine
 use n = 8, grid 8, population 32, elite 6 and training every 7 generations; unit-square uses n = 20,
-grid 16, population 32, elite 12, initial pool 128, 4 immigrants and training every 10.  Each run starts
-from a fresh random seed, so results vary from run to run.
+grid 16, population 32, elite 12, initial pool 128, 4 immigrants and training every 10.  By default each
+run starts from a fresh random seed, so results vary from run to run.  To replay the original run, use the
+seed recorded for this cell with `--paper-seeds` (or choose a seed with `--seed N`):
+
+```bash
+python reproduce.py --mode single --problem unit_square --paper-seeds --iterations 250
+```
+
+The recorded seeds and settings of all 81 original runs are in
+`docs/assets/replacement_81_final_20260712/data/final_81_seeds.json`.  A seed with matching settings is
+intended for replay, but results can differ across library versions, hardware and thread counts.  The
+unit-square record (20/13) first appeared at generation 190 in the original run; the MISR and guillotine
+records appeared after about 3.1 and 5.8 hours on the original hardware.
 
 Results are written to `runs/single_<problem>/`, and the exact cell is recorded in
 `runs/single_<problem>/best_cell.jsonl`.  A summary CSV and audit JSON are generated
@@ -310,9 +321,10 @@ PYTHONPATH=src python3 -m multilevel.cli audit \
 | Unit-square stabbing | **1.538** (= 20/13) | `sqstab_exact_grid / symmetry_crossover_hillclimb / exact_stab_gap_pressure` |
 | Guillotine | **0.333** (= 1/3) | `rect_direct_disjoint / witness_breaking / depth_limited_dp` |
 
-Because each run starts from a fresh random seed, exact scores may differ slightly from the paper.
-The paper ran each cell exactly once with no repeated-seed axis; the committed certificates are the
-primary evidence, and certificate verification (Mode 1) is the definitive reproducibility check.
+Unless `--paper-seeds` is given, each run starts from a fresh random seed, so exact scores may differ
+from the paper.  The paper ran each cell exactly once with no repeated-seed axis; the committed
+certificates are the primary evidence, and certificate verification (Mode 1) is the definitive
+reproducibility check.  `--mode full --paper-seeds` uses the recorded seed of every cell.
 
 ---
 

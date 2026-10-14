@@ -252,15 +252,23 @@ BEST_CONFIGS = {
 }
 
 
-def _final_81_rows() -> list[dict]:
+SEED_MANIFEST = (
+    ROOT / "docs" / "assets" / "replacement_81_final_20260712" / "data" / "final_81_seeds.json"
+)
+
+
+def _final_81_rows(paper_seeds: bool = False) -> list[dict]:
     """The paper's final 81 cells, each with its own cohort's runtime settings.
 
     Not `multilevel.cli matrix --stage main` (original design only).  See
-    `multilevel.components.build_final_81_matrix` for the cohort rules.
+    `multilevel.components.build_final_81_matrix` for the cohort rules.  With
+    `paper_seeds`, each row uses the seed recorded for it in the original runs;
+    otherwise every row gets a fresh random seed.
     """
-    from multilevel.components import build_final_81_matrix
+    from multilevel.components import build_final_81_matrix, load_seed_manifest
 
-    return build_final_81_matrix()
+    seeds = load_seed_manifest(SEED_MANIFEST) if paper_seeds else None
+    return build_final_81_matrix(seeds=seeds)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -282,8 +290,18 @@ def _find_matrix_index(rows: list[dict], problem: str, cfg: dict) -> int:
     )
 
 
-def mode_single(problem: str, iterations: int, has_torch: bool) -> None:
-    """Run the paper's best-scoring configuration for one problem."""
+def mode_single(
+    problem: str,
+    iterations: int,
+    has_torch: bool,
+    seed: int | None = None,
+    paper_seeds: bool = False,
+) -> None:
+    """Run the paper's best-scoring configuration for one problem.
+
+    `seed` sets an explicit RNG seed; `paper_seeds` uses the seed recorded for this
+    cell in the original run.  By default the seed is fresh and random.
+    """
     cfg = BEST_CONFIGS[problem]
     print(f"\n=== MODE: single (problem={problem}) ===")
     print(
@@ -298,11 +316,17 @@ def mode_single(problem: str, iterations: int, has_torch: bool) -> None:
         "      64–97% of the total budget.\n"
     )
 
-    out_root = ROOT / "runs" / f"single_{problem}"
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    rows = _final_81_rows()
+    rows = _final_81_rows(paper_seeds=paper_seeds)
     idx = _find_matrix_index(rows, problem, cfg)
+    if seed is not None:
+        rows[idx]["rng_seed"] = seed
+    used_seed = rows[idx]["rng_seed"]
+    # A fixed seed gets its own output directory, so checkpoints of another run
+    # are never resumed by mistake.
+    suffix = f"_seed{used_seed}" if (seed is not None or paper_seeds) else ""
+    out_root = ROOT / "runs" / f"single_{problem}{suffix}"
+    out_root.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] RNG seed: {used_seed}" + (" (recorded in the original run)" if paper_seeds else ""))
     matrix_file = out_root / "best_cell.jsonl"
     _write_jsonl(matrix_file, [rows[idx]])
     print(f"[INFO] Wrote single-cell matrix {matrix_file.relative_to(ROOT)}")
@@ -410,7 +434,7 @@ def _run_cell(args: tuple) -> tuple[int, int]:
     return idx, rc
 
 
-def mode_full(iterations: int, parallel: int, has_torch: bool) -> None:
+def mode_full(iterations: int, parallel: int, has_torch: bool, paper_seeds: bool = False) -> None:
     """Run all 81 PatternBoost cells (HPC-scale)."""
     print("\n=== MODE: full ===")
     print(
@@ -431,7 +455,9 @@ def mode_full(iterations: int, parallel: int, has_torch: bool) -> None:
 
     matrix_file = ROOT / "runs" / "final_81_matrix.jsonl"
     print("[INFO] Generating the paper's final 81-cell matrix...")
-    _write_jsonl(matrix_file, _final_81_rows())
+    _write_jsonl(matrix_file, _final_81_rows(paper_seeds=paper_seeds))
+    if paper_seeds:
+        print("[INFO] Using the seeds recorded for each cell in the original runs.")
 
     with matrix_file.open() as f:
         n_rows = sum(1 for _ in f)
@@ -517,6 +543,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for --mode single (default: fresh random seed).",
+    )
+    p.add_argument(
+        "--paper-seeds",
+        action="store_true",
+        help=(
+            "Use the seeds recorded in the original runs (--mode single: this cell's seed; "
+            "--mode full: all 81 cells)."
+        ),
+    )
+    p.add_argument(
         "--parallel",
         type=int,
         default=1,
@@ -550,7 +590,15 @@ def main() -> None:
         mode_smoke()
 
     elif args.mode == "single":
-        mode_single(args.problem, args.iterations if args.iterations is not None else 200, has_torch)
+        if args.seed is not None and args.paper_seeds:
+            sys.exit("[ERROR] Use either --seed or --paper-seeds, not both.")
+        mode_single(
+            args.problem,
+            args.iterations if args.iterations is not None else 200,
+            has_torch,
+            seed=args.seed,
+            paper_seeds=args.paper_seeds,
+        )
 
     elif args.mode == "figures":
         if not check_analysis_deps():
@@ -564,7 +612,9 @@ def main() -> None:
 
     elif args.mode == "full":
         iters = args.iterations if args.iterations is not None else 1_000_000
-        mode_full(iters, args.parallel, has_torch)
+        if args.seed is not None:
+            sys.exit("[ERROR] --seed applies to --mode single; use --paper-seeds for --mode full.")
+        mode_full(iters, args.parallel, has_torch, paper_seeds=args.paper_seeds)
 
 
 if __name__ == "__main__":

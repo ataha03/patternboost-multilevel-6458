@@ -86,6 +86,20 @@ from a fresh random seed, so scores vary between runs; a short run will usually
 not reach the paper's best value. Use `--mode verify` to check the reported
 constructions exactly.
 
+The seeds and settings of the original runs are recorded in
+`docs/assets/replacement_81_final_20260712/data/final_81_seeds.json`. Add
+`--paper-seeds` to `--mode single` or `--mode full` to use the recorded seeds, or
+`--seed N` (single mode) for any other seed:
+
+```bash
+python3 reproduce.py --mode single --problem unit_square --paper-seeds --iterations 250
+```
+
+A recorded seed with the recorded settings is meant for replay, but results can
+differ across software versions and hardware. The unit-square record is reached
+within a few hundred generations; the MISR and guillotine records took several
+hours on the original hardware.
+
 ## Running Cells Directly
 
 Generate the paper's final 81-cell matrix. Each row carries its own settings

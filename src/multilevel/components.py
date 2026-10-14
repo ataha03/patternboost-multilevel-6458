@@ -402,11 +402,27 @@ RETAINED_RUNTIME_OVERRIDES: dict[str, int] = {
 }
 
 
+def load_seed_manifest(path: str | Path) -> dict[tuple[str, str, str, str], int]:
+    """Read a seed manifest (``records`` with ``rng_seed_decimal``) keyed by cell.
+
+    Seeds are exact decimal strings in the file and are converted to ``int`` here.
+    """
+    import json
+    from pathlib import Path
+
+    records = json.loads(Path(path).read_text(encoding="utf-8"))["records"]
+    return {
+        (r["problem"], r["representation"], r["local_search"], r["surrogate"]): int(r["rng_seed_decimal"])
+        for r in records
+    }
+
+
 def build_final_81_matrix(
     *,
     stage: str = "main",
     budget_seconds: int = 86_400,
     git_commit: str = "",
+    seeds: "dict[tuple[str, str, str, str], int] | None" = None,
 ) -> list[dict[str, object]]:
     """Build the paper's final 81-cell table with each cell's own cohort settings.
 
@@ -458,7 +474,11 @@ def build_final_81_matrix(
                         problem=problem, **cell, budget_seconds=budget_seconds, git_commit=git_commit
                     ),
                     "stage": stage,
-                    "rng_seed": fresh_rng_seed(),
+                    "rng_seed": (
+                        seeds[(problem, representation, local_search, surrogate)]
+                        if seeds is not None and (problem, representation, local_search, surrogate) in seeds
+                        else fresh_rng_seed()
+                    ),
                     "budget_seconds": budget_seconds,
                     "git_commit": git_commit or None,
                     "problem": problem,

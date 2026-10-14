@@ -24,6 +24,7 @@ from multilevel.components import (
     build_symmetry_crossover_matrix,
     build_unit_square_restart_matrix,
     fresh_rng_seed,
+    load_seed_manifest,
 )
 from multilevel.exploratory import run_exploratory_search
 from multilevel.followup import build_followup_matrix
@@ -83,10 +84,12 @@ def cmd_matrix(args: argparse.Namespace) -> int:
 
 
 def cmd_final_81_matrix(args: argparse.Namespace) -> int:
+    seeds = load_seed_manifest(args.seeds_file) if args.seeds_file else None
     rows = build_final_81_matrix(
         stage=args.stage,
         budget_seconds=int(args.budget_seconds),
         git_commit=args.git_commit or "",
+        seeds=seeds,
     )
     out = Path(args.out)
     _write_jsonl(out, rows)
@@ -586,6 +589,11 @@ def build_parser() -> argparse.ArgumentParser:
     final_81.add_argument("--stage", default="main")
     final_81.add_argument("--budget-seconds", type=int, default=86400)
     final_81.add_argument("--git-commit", default=None)
+    final_81.add_argument(
+        "--seeds-file",
+        default=None,
+        help="seed manifest JSON (e.g. final_81_seeds.json); omitted means fresh random seeds",
+    )
     final_81.add_argument("--out", default="runs/final_81_matrix.jsonl")
     final_81.set_defaults(func=cmd_final_81_matrix)
 
